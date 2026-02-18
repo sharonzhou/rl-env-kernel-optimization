@@ -6,7 +6,7 @@ Runs the full pipeline on a single, self-contained task that executes on CPU
 (no GPU required) to prove functional correctness of each component:
 
   1. Prompt constructor  → generates a kernel-optimization prompt
-  2. Claude API agent    → receives the prompt, writes a solution to output/
+  2. Claude Code agent   → receives the prompt, writes a solution to output/
   3. Local grader        → grades compilation, correctness, and speedup
   4. Score report        → prints results
 
@@ -14,21 +14,21 @@ The mini task: optimize a naive Python RMSNorm into a faster NumPy version.
 This is intentionally simple so the eval completes quickly and works without
 AMD hardware. Real RL tasks use HIP/Triton kernels on MI355X.
 
+Agent: Claude Code (claude-agent-sdk). Auth is handled by the Claude Code CLI
+itself — no ANTHROPIC_API_KEY required.
+
 Usage:
     python3 eval.py [--model MODEL] [--max-turns N] [--task-dir PATH] [--dry-run]
-
-Environment:
-    ANTHROPIC_API_KEY  must be set
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import subprocess
 import sys
-import time
 import textwrap
 from pathlib import Path
 
@@ -180,127 +180,61 @@ def setup_task(task_dir: Path) -> None:
 # 2. PROMPT — use the real kernel_prompt constructor
 # ══════════════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = textwrap.dedent("""\
-    You are an expert GPU kernel engineer specializing in AMD ROCm optimization.
-    You will be given a kernel optimization task. Your job is to write an
-    optimized implementation and save it to the specified output path.
-
-    Available tools:
-    - read_file: read any file in the sandbox
-    - write_file: write your solution to output/
-    - run_python: execute a Python snippet to test logic
-
-    Constraints:
-    - Output ALL code to output/{task_id}/solution.py
-    - The function signature must be: rms_norm(x, weight, eps=1e-6) -> list[float]
-    - Do NOT modify baseline.py, test_solution.py, or bench.py
-    - Pure Python or NumPy only (no GPU libraries for this mini eval)
-""")
-
 TASK_PROMPT = textwrap.dedent(f"""\
     ## Task: Optimize RMSNorm (CPU mini eval)
 
-    This is a functional test of the RL optimization pipeline.
-    Target: make rms_norm() as fast as possible in pure Python or NumPy.
-
-    ## Baseline (output/{TASK_ID}/baseline.py)
-    The baseline uses a slow pure-Python loop. Read it first.
-
-    ## Your solution
-    Write an optimized implementation to:
-        output/{TASK_ID}/solution.py
+    Baseline kernel:   output/{TASK_ID}/baseline.py
+    Write solution to: output/{TASK_ID}/solution.py
 
     The function signature must be:
         def rms_norm(x: list[float], weight: list[float], eps: float = 1e-6) -> list[float]
 
     Optimization ideas:
-    - Use numpy for vectorized operations (math.sqrt → np.sqrt, sum → np.sum)
-    - Avoid Python for-loops entirely
+    - Use numpy for vectorized operations (replace all Python loops)
     - Use np.linalg.norm or manual vectorized RMS
 
-    ## Steps
+    Steps:
     1. Read baseline.py to understand the function
     2. Write your optimized solution.py
-    3. Verify correctness against the baseline logic before submitting
+    3. Run `python output/{TASK_ID}/test_solution.py` to verify correctness
+    4. Done — do not modify baseline.py, test_solution.py, or bench.py
 """)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. AGENT — Anthropic API with file-read/write tools
+# 3. AGENT — Claude Code via Python Agent SDK
 # ══════════════════════════════════════════════════════════════════════════════
 
-TOOLS = [
-    {
-        "name": "read_file",
-        "description": "Read a file from the sandbox.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Relative path from repo root"}
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to a file in the sandbox.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path":    {"type": "string", "description": "Relative path from repo root"},
-                "content": {"type": "string", "description": "File content"},
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "run_python",
-        "description": "Execute a Python snippet and return stdout+stderr.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Python code to execute"}
-            },
-            "required": ["code"],
-        },
-    },
-]
+async def _run_agent_async(task_dir: Path, model: str, max_turns: int) -> tuple[list, bool]:
+    """Drive Claude Code via the Agent SDK. Returns (trajectory, solution_written)."""
+    from claude_agent_sdk import query, ClaudeAgentOptions
 
+    options = ClaudeAgentOptions(
+        cwd=str(REPO_ROOT),
+        model=model,
+        max_turns=max_turns,
+        permission_mode="bypassPermissions",
+        system_prompt="You are an expert GPU kernel engineer specializing in AMD ROCm optimization.",
+    )
 
-def handle_tool(name: str, inp: dict, task_dir: Path) -> str:
-    if name == "read_file":
-        p = REPO_ROOT / inp["path"]
-        if not p.exists():
-            return f"ERROR: file not found: {inp['path']}"
-        return p.read_text()
+    trajectory = []
+    async for message in query(prompt=TASK_PROMPT, options=options):
+        trajectory.append(message)
+        # Log tool calls (observability / future RL reward shaping)
+        if hasattr(message, "content"):
+            for block in message.content:
+                if hasattr(block, "name"):      # ToolUseBlock
+                    print(f"    tool: {block.name}({list(block.input.keys())})")
+        if hasattr(message, "num_turns"):       # ResultMessage
+            cost = getattr(message, "total_cost_usd", 0.0) or 0.0
+            print(f"  result: turns={message.num_turns}, cost=${cost:.4f}")
 
-    elif name == "write_file":
-        p = REPO_ROOT / inp["path"]
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(inp["content"])
-        return f"OK: wrote {len(inp['content'])} chars to {inp['path']}"
-
-    elif name == "run_python":
-        try:
-            result = subprocess.run(
-                [sys.executable, "-c", inp["code"]],
-                capture_output=True, text=True, timeout=10,
-                cwd=str(REPO_ROOT),
-            )
-            out = result.stdout + result.stderr
-            return out[:2000] if out else "(no output)"
-        except subprocess.TimeoutExpired:
-            return "ERROR: timeout"
-        except Exception as e:
-            return f"ERROR: {e}"
-
-    return f"ERROR: unknown tool {name}"
+    return trajectory, (task_dir / "solution.py").exists()
 
 
 def run_agent(task_dir: Path, model: str, max_turns: int, dry_run: bool) -> bool:
-    """Run the Claude API agent. Returns True if a solution.py was written."""
+    """Run the Claude Code agent. Returns True if solution.py was written."""
     if dry_run:
-        # Write a trivial numpy solution without calling the API
         print("  [dry-run] writing trivial numpy solution...")
         solution = textwrap.dedent("""\
             import numpy as np
@@ -314,57 +248,22 @@ def run_agent(task_dir: Path, model: str, max_turns: int, dry_run: bool) -> bool
         (task_dir / "solution.py").write_text(solution)
         return True
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY not set")
-        return False
-
     try:
-        import anthropic
+        from claude_agent_sdk import query, ClaudeAgentOptions  # noqa: F401
     except ImportError:
-        print("ERROR: anthropic package not installed. Run: pip install anthropic")
+        print("ERROR: claude-agent-sdk not installed. Run: pip install claude-agent-sdk")
         return False
 
-    client   = anthropic.Anthropic(api_key=api_key)
-    messages = [{"role": "user", "content": TASK_PROMPT}]
+    # The SDK merges os.environ into the subprocess env. Strip CLAUDECODE so the
+    # nested-session guard in the claude CLI does not block this programmatic launch.
+    _cc = os.environ.pop("CLAUDECODE", None)
+    try:
+        _, solution_written = asyncio.run(_run_agent_async(task_dir, model, max_turns))
+    finally:
+        if _cc is not None:
+            os.environ["CLAUDECODE"] = _cc
 
-    print(f"  model: {model}, max_turns: {max_turns}")
-
-    for turn in range(max_turns):
-        print(f"  turn {turn + 1}/{max_turns} ...", end=" ", flush=True)
-        t0 = time.time()
-
-        response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
-
-        elapsed = time.time() - t0
-        print(f"stop_reason={response.stop_reason} ({elapsed:.1f}s)")
-
-        # Collect assistant content
-        messages.append({"role": "assistant", "content": response.content})
-
-        if response.stop_reason == "end_turn":
-            break
-
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    print(f"    tool: {block.name}({list(block.input.keys())})")
-                    result = handle_tool(block.name, block.input, task_dir)
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": block.id,
-                        "content":     result,
-                    })
-            messages.append({"role": "user", "content": tool_results})
-
-    return (task_dir / "solution.py").exists()
+    return solution_written
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -463,7 +362,7 @@ def main():
     parser.add_argument("--task-dir",  default=None,
                         help="Override output task directory")
     parser.add_argument("--dry-run",   action="store_true",
-                        help="Skip API call; write a trivial solution and grade it")
+                        help="Skip Claude Code call; write a trivial solution and grade it")
     args = parser.parse_args()
 
     task_dir = Path(args.task_dir) if args.task_dir else REPO_ROOT / "output" / TASK_ID
@@ -474,6 +373,7 @@ def main():
     print("=" * 60)
     print(f"  Task:    {TASK_ID}")
     print(f"  Model:   {args.model}")
+    print(f"  Agent:   Claude Code (claude-agent-sdk)")
     print(f"  Output:  {task_dir}")
     print("")
 
