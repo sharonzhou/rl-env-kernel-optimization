@@ -22,8 +22,5 @@ files/docs/
 # ── Magpie clone (tools/setup_tools.sh) ──────────────────────────────────────
 tools/magpie/
 
-# ── RAG tool generated files (tools/setup_tools.sh) ──────────────────────────
-tools/rag_tool/index.py
-tools/rag_tool/server.py
-tools/rag_tool/mcp_config_snippet.json
+# ── RAG tool generated data ───────────────────────────────────────────────────
 tools/rag_tool/chroma_db/
