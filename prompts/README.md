@@ -1,4 +1,3 @@
-
 Default prompt template includes RAG (or RAG is a tool)
 
 MI355 prompt template
