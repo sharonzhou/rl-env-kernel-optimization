@@ -1,4 +1,4 @@
-Use a setup.sh script to download the following into the RL env sandbox:
+Use a setup_files.sh script to download the following into the RL env sandbox:
 * [ROCm](https://github.com/ROCm/) (code, curated subset of relevant ones)
   * [rocm-libraries](https://github.com/ROCm/rocm-libraries) — monorepo (hipBLAS, rocBLAS, hipFFT, hipSPARSE, rocSPARSE, rocPRIM, rocsolver, MIOpen, and more)
   * [hipBLASLt](https://github.com/ROCm/hipBLASLt) — flexible GEMM API
@@ -18,8 +18,14 @@ Use a setup.sh script to download the following into the RL env sandbox:
 * [AITER](https://github.com/ROCm/aiter) (code)
 * [Triton](https://github.com/triton-lang/triton) (code)
 * [SGLang](https://github.com/sgl-project/sglang) and [vLLM](https://github.com/vllm-project/vllm) (code)
-* ROCm documentation (PDFs)
 
+Look for documentation and download them, about:
+* ROCm docs[https://rocm.docs.amd.com/]
+* HIP and CK docs
+* Tutorials on HIP/ROCm kernel optimization
+* AMD Instinct GPUs
+* MI355X architecture whitepapers, technical documentation, instruction set information
+* Triton docs
 
 Create markdown files with:
 * Best practices for writing kernels in HIP
